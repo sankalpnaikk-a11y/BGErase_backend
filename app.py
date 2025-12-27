@@ -7,17 +7,32 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from rembg import remove, new_session
 from PIL import Image
+import gc  # ✅ ADDED (memory cleanup)
 
-# ✅ CREATE APP ONLY ONCE
 app = FastAPI(title="Background Remover API (HQ Portrait)")
 
-# Try portrait-optimized model, fall back to generic U2Net
-try:
-    SESSION = new_session("u2net_human_seg")
-except Exception:
-    SESSION = new_session("u2net")
+# =========================
+# 🔹 ADDED: lazy-loaded session
+# =========================
+SESSION = None
 
-# CORS
+
+# =========================
+# 🔹 ADDED: startup hook
+# =========================
+@app.on_event("startup")
+def load_model():
+    global SESSION
+    try:
+        print("Loading u2net_human_seg model...")
+        SESSION = new_session("u2net_human_seg")
+        print("Loaded portrait model")
+    except Exception as e:
+        print("Falling back to u2net:", e)
+        SESSION = new_session("u2net")
+
+
+# CORS for frontend (Render / Vercel / local)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,9 +41,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def read_root():
     return {"status": "ok", "message": "Background Remover API running"}
+
 
 @app.post("/process-image")
 async def process_image(
@@ -59,23 +76,44 @@ async def process_image(
             cutout = cutout.crop(bbox)
 
         if bg_color:
-            color = bg_color.lstrip("#")
-            r, g, b = int(color[0:2],16), int(color[2:4],16), int(color[4:6],16)
-            bg = Image.new("RGBA", cutout.size, (r, g, b, 255))
-            bg.paste(cutout, mask=cutout.split()[3])
-            output = bg
+            color = bg_color.strip()
+            if color.startswith("#"):
+                color = color[1:]
+            if len(color) == 3:
+                color = "".join([c * 2 for c in color])
+            if len(color) != 6:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "bg_color must be a valid hex color like #ffffff"},
+                )
+
+            r = int(color[0:2], 16)
+            g = int(color[2:4], 16)
+            b = int(color[4:6], 16)
+
+            background = Image.new("RGBA", cutout.size, (r, g, b, 255))
+            background.paste(cutout, mask=cutout.split()[3])
+            output_image = background
         else:
-            output = cutout
+            output_image = cutout
 
         if width and height:
-            output = output.resize((width, height), Image.LANCZOS)
+            output_image = output_image.resize((width, height), Image.LANCZOS)
 
         buf = io.BytesIO()
-        output.save(buf, format="PNG")
+        output_image.save(buf, format="PNG")
         buf.seek(0)
 
-        return StreamingResponse(buf, media_type="image/png")
+        # 🔹 ADDED: explicit memory cleanup
+        del input_image, cutout
+        gc.collect()
+
+        return StreamingResponse(
+            buf,
+            media_type="image/png",
+            headers={"Content-Disposition": 'attachment; filename="output.png"'},
+        )
 
     except Exception as e:
-        print("ERROR:", e)
+        print("ERROR in /process-image:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
