@@ -7,14 +7,25 @@ from fastapi.responses import StreamingResponse, JSONResponse
 
 from rembg import remove, new_session
 from PIL import Image
+import asyncio
 
 app = FastAPI(title="BGErase – Background Remover API (U2Net refined)")
 
 # -----------------------------
-# MODEL: U2Net (you liked this one more)
+# MODEL: U2Net (lazy load on startup)
 # -----------------------------
-SESSION = new_session("u2net")
+SESSION = None
 MAX_MODEL_SIDE = 1800  # a bit larger than before for more detail
+
+async def _load_model():
+    """Load the heavy model in a thread so startup is non-blocking."""
+    global SESSION
+    SESSION = await asyncio.to_thread(new_session, "u2net")
+
+@app.on_event("startup")
+async def startup_event():
+    # start loading in background (don't await) so the server binds the port quickly
+    asyncio.create_task(_load_model())
 
 
 # -----------------------------
@@ -32,6 +43,10 @@ app.add_middleware(
 @app.get("/")
 def read_root():
     return {"status": "ok", "model": "u2net"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": SESSION is not None}
 
 
 # -----------------------------
@@ -75,6 +90,8 @@ async def process_image(
     quality: Optional[int] = Form(90),         # for jpeg/webp
 ):
     try:
+        if SESSION is None:
+            return JSONResponse(status_code=503, content={"error": "model_loading"})
         contents = await file.read()
         input_image = Image.open(io.BytesIO(contents)).convert("RGBA")
         orig_w, orig_h = input_image.size
